@@ -6,6 +6,8 @@
 #include <string>
 #include <sstream>
 #include <fstream>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #define WIDTH 640
 #define HEIGHT 480
@@ -28,7 +30,6 @@ static const char* quad_shader_fs = R"(
 #version 460
 
 layout(location = 0) uniform sampler2D tex;
-layout(location = 1) uniform float time;
 in vec2 uv;
 out vec4 color;
 
@@ -70,6 +71,7 @@ layout(location = 1) uniform ivec2 size;
 
 layout(binding = 0, rgba32f) uniform image2D sourceTex;
 layout(binding = 1, rgba32f) uniform image2D destTex;
+layout(binding = 2, rgba32f) uniform image2D shapeTex;
 
 //	Classic Perlin 3D Noise
 //	by Stefan Gustavson
@@ -155,24 +157,81 @@ void main()
     if (storePos.y < 1 || storePos.y >= size.y - 1) return;
 
 
+    // Calculate the average of the four neighbouring pixels
     vec4 c0 = imageLoad(sourceTex, storePos + ivec2(1, 0));
     vec4 c1 = imageLoad(sourceTex, storePos + ivec2(-1,0));
     vec4 c2 = imageLoad(sourceTex, storePos + ivec2(0, 1));
     vec4 c3 = imageLoad(sourceTex, storePos + ivec2(0,-1));
     vec4 newCol = (c0+c1+c2+c3) * 0.25;
+
+    // Pick a random point to sample noise from based on the time and
+    // the pixel location.
     vec3 noisePoint = vec3(storePosf*15 - vec2(0, 8*time), time);
-    float stride = cnoise(noisePoint+vec3(time));
+
+    // Use the point to sample the noise and scale it constantly over the y-axis.
     float cooling = 0.4 * abs(cnoise(noisePoint)) * storePosf.y;
     newCol -= vec4(cooling);
-    if (storePos.y < 8) newCol = vec4(1);
+
+    // Use a slightly different point to sample a stride value
+    float stride = cnoise(noisePoint+vec3(time));
+
+    // Sample the texture containing text
+    vec4 shape = imageLoad(shapeTex, storePos);
+
+    // If we are in the lower part of the image add a constant energy source.
+    if (storePos.y < 3) newCol = vec4(1);
+
+    // If there is any value in the text, we undo the cooling and then some.
+    if (max(shape.r, max(shape.g, shape.b)) > 0.01) newCol += vec4(cooling*1.8);
+
+    // Store the result in the destination texture 2 pixels up and
+    // on a maximum of 3 pixels sideways depending on the stride value.
     imageStore(destTex, storePos + ivec2(stride*3,2), newCol);
 }
 
 )";
 
+
+GLuint loadTexture(const char* filename) {
+  int width, height, nrChannels;
+
+  unsigned char* data = stbi_load(filename, &width, &height, &nrChannels, 0);
+  if (!data) {
+    fprintf(stderr, "Could not load texture: %s", filename);
+    exit(8);
+  } else { fprintf(stderr, "Loaded texture %s (%ix%i)", filename, width, height);
+  }
+
+  // Convert the byte data to 4 component float
+  float* fdata = (float*)malloc(width*height*4*sizeof(float));
+  float corr = 1.0f/256.0f;
+  for(int y=0; y<height; y++)
+  {
+    for(int x=0; x<width; x++) {
+      fdata[x*4+(height-y-1)*4*width+0] = (float)data[x*nrChannels+y*nrChannels*width+0] * corr;
+      fdata[x*4+(height-y-1)*4*width+1] = (float)data[x*nrChannels+y*nrChannels*width+1] * corr;
+      fdata[x*4+(height-y-1)*4*width+2] = (float)data[x*nrChannels+y*nrChannels*width+2] * corr;
+      fdata[x*4+(height-y-1)*4*width+3] = 0;
+    }
+  }
+
+  GLuint texture;
+  glGenTextures(1, &texture);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, fdata);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+  // free image data on the host
+  stbi_image_free(data);
+  free(fdata);
+
+  return texture;
+}
+
+
 inline static GLuint CompileShader(GLint type, const char* source)
 {
-  // Preprocess macro's
   GLuint shader = glCreateShader(type);
   glShaderSource(shader, 1, &source, NULL);
   glCompileShader(shader);
@@ -189,7 +248,7 @@ inline static GLuint CompileShader(GLint type, const char* source)
     GLchar* errorLog = (GLchar*)malloc(maxLength);
     glGetShaderInfoLog(shader, maxLength, &maxLength, errorLog);
 
-    printf("Error in shader: %s", errorLog);
+    fprintf(stderr, "Error in shader: %s", errorLog);
 
     free(errorLog);
     return -1;
@@ -212,7 +271,7 @@ inline static GLuint GenerateProgram(GLuint cs)
     GLchar* errorLog = (GLchar*)malloc(maxLength);
     glGetProgramInfoLog(program, maxLength, &maxLength, errorLog);
 
-    printf("Shader linker error: %s", errorLog);
+    fprintf(stderr, "Shader linker error: %s", errorLog);
 
     glDeleteProgram(program);
     exit(5);
@@ -235,7 +294,7 @@ inline static GLuint GenerateProgram(GLuint vs, GLuint fs)
     GLchar* errorLog = (GLchar*)malloc(maxLength);
     glGetProgramInfoLog(program, maxLength, &maxLength, errorLog);
 
-    printf("Shader linker error: %s", errorLog);
+    fprintf(stderr, "Shader linker error: %s", errorLog);
 
     glDeleteProgram(program);
     exit(5);
@@ -265,6 +324,7 @@ int main(int argc, char** argv) {
     glDisable(GL_DEPTH_TEST);
     glfwSwapInterval(0);
 
+    // Compile the shaders
     GLuint quad_vs = CompileShader(GL_VERTEX_SHADER, quad_shader_vs);
     GLuint quad_fs = CompileShader(GL_FRAGMENT_SHADER, quad_shader_fs);
     GLuint quad_shader = GenerateProgram(quad_vs, quad_fs);
@@ -303,29 +363,53 @@ int main(int argc, char** argv) {
         glTextureParameteri(i, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
 
+    // Load the texture with text on it.
+    GLuint shapeTex = loadTexture("text.png");
 
     int tick = 0;
     while(!glfwWindowShouldClose(window))
     {
         double ping = glfwGetTime();
+
+        // Bind the compute shader
         glUseProgram(fire_program);
+
+        // Send the uniform information
         glUniform1f(0, glfwGetTime());
         glUniform2i(1, WIDTH, HEIGHT);
+
+        // Link the textures to the slots
         glBindImageTexture(0, buf[tick%2], 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
         glBindImageTexture(1, buf[(tick+1)%2], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        glBindImageTexture(2, shapeTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+
+        // Dispatch the compute shader over a range that includes all pixels
         glDispatchCompute(WIDTH/32+1, HEIGHT/32+1, 1);
 
+        // Clear the screen
         glClear(GL_COLOR_BUFFER_BIT);
+
+        // Use the quad shader
         glUseProgram(quad_shader);
-        glUniform1f(1, glfwGetTime());
+
+        // Bind the texture (slot 0 is selected by default, i.e. GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, buf[tick%2]);
+
+        // Restore the state for rendering a quad
         glBindVertexArray(quad_vao);
+
+        // Draw the 6 vertices that make up the quad
         glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        // Unbind the quad vao
         glBindVertexArray(0);
 
         glfwPollEvents();
         glfwSwapBuffers(window);
         tick++;
+
+        // I suffered from a bug where vsync was not working so
+        // I added this rough blocking while loop to clamp the fps to 60
         while(glfwGetTime() - ping < 1.0 / 60) {}
     }
 
